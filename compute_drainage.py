@@ -50,77 +50,71 @@ def separate_oceans(self):
 
   #print "Changing region minutely to create edges for vector map" # N and S set to deal with mapcalc error
   #grass.run_command('g.region',flags='p',w='-179.9999',e='180',n='75',s='-68',rows='256',cols='512')
+  import grass.script as grass
+  import grass.script.array as garray
+  from grass.pygrass.modules import Module
+  import numpy as np
+  from grass.script import db_select
+
+#get all of the GRASS modules that we will use:
+  mapcalc   = Module("r.mapcalc")   
+  to_vect   = Module("r.to.vect")
+  category  = Module("v.category")
+  table     = Module("v.db.addtable")
+  to_db     = Module("v.to.db")
+  addcolumn = Module("v.db.addcolumn")
+  execute   = Module("db.execute")
+  select    = Module("db.select")
+  to_rast   = Module("v.to.rast")
+  export    = Module("r.out.gdal")   
 
   for age in self.ages:
-    print age
-    tpi = 'tpi_' + age # "topo plus ice"
-    sl_binary="sl_binary_" + age
-    ocean_binary="ocean_binary_" + age
-    notocean_only="notocean_only_" + age
+    sl_binary = "sl_binary_GEBCO2020_" + age
+    sl_binary_vector = "sl_binary_GEBCO2020_" + age + "_vector"
+    ocean_binary = "ocean_binary_" + age
+    ocean_binary_raster = "ocean_binary_" + age + "_raster"
 
-    print "Creating binary above/below sea level map and converting to vector..."
-    # Make raster
-    try:
-      mapcalc (sl_binary + ' = ' + tpi + ' > 0', overwrite=True)
-    except:
-      pass
-    # Convert raster to vector; "value" column has 1 (land) and 0 (water)
-    grass.run_command('r.to.vect' , input=sl_binary , output=sl_binary , type='area' , overwrite=True, quiet=True)
-    #grass.run_command('v.to.rast' , input=sl_binary , output='sl_binary_echo' , use='attr', attrcolumn='value' , overwrite=True)
+    print("get the mask for time "+age)
+    #Create a binary above/below sea level map:
+    mapcalc(sl_binary + " = Topo_initial_guess_000000 >0",overwrite=True)
+    #convert it to vector with 1 (land) and 0 (ocean):
+    print("convert to vector")
+    to_vect(input=sl_binary, output=sl_binary_vector,type="area",overwrite=True,quiet=True)
+    #add categories for boundaries of the input vector map, in layer 2:
+    category(input=sl_binary_vector,output=ocean_binary,layer='2',type='boundary',option='add',overwrite=True,quiet=True)
+    #add columns 'left' and 'right' and upload the categories of the left and right areas:
+    table(map=ocean_binary,layer='2',quiet=True)
+    to_db(map=ocean_binary,option='sides',columns='left,right',layer='2',quiet=True)
+    #add a column 'notocean':
+    addcolumn(map=ocean_binary,layer='1',columns='notocean integer',quiet=True)
+    #set default value in this column to '1' (i.e. land)
+    execute(stdin="UPDATE "+ocean_binary+" SET notocean=1",input='-',quiet=True)
 
-    print "Finding values at edges of vector map..."
-    # Get rid of old layer, in case it is there and in the way
-    grass.run_command("g.remove" , type='vector', name=ocean_binary, flags='f')
-    # add categories for boundaries of the input vector map, in layer 2:
-    grass.run_command('v.category' , input=sl_binary , output=ocean_binary , layer='2' , type='boundary' ,  option='add', quiet=True)
-    # add a table with columns named "left" and "right" to layer 2 of the input
-    # vector map:
-    grass.run_command('v.db.addtable', map=ocean_binary, layer='2', columns="left integer,right integer", quiet=True)
-    # find and upload categories of left and right areas:
-    grass.run_command('v.to.db', map=ocean_binary, option='sides', columns='left,right', layer='2', quiet=True)
-    # Add a column to Layer 1 ("notocean")
-    grass.run_command('v.db.addcolumn', map=ocean_binary, layer='1', columns="notocean integer", quiet=True)
-    # Set default value in this column to "1" (i.e. land or intracontinental below SL areas)
-    grass.write_command('db.execute', stdin='UPDATE ' + ocean_binary + ' SET notocean=1', input='-', quiet=True)
-
-    print "Finding polygons that touch edge; those that do are ocean..."
-    # db_select must have changed: causing problems. So need to convert to list via numpy squeeze
-    edgel = np.squeeze(np.array(db.db_select(table=ocean_binary, sql='SELECT right FROM ' + ocean_binary + '_2 WHERE left=-1')))
+    print("find edge polygons")
+    #Find polygons that touch the edge - those that do are ocean. 
+    edgel = np.squeeze(np.array(db_select(table=ocean_binary,sql='SELECT right FROM '+ocean_binary_2+' WHERE left=-1')))
     if edgel.ndim == 0:
       edgel = np.array([str(edgel)])
-    edger = np.squeeze(np.array(db.db_select(table=ocean_binary, sql='SELECT left FROM ' + ocean_binary + '_2 WHERE right=-1')))
+    edger = np.squeeze(np.array(db_select(table=ocean_binary, sql='SELECT left FROM  '+ocean_binary_2+' WHERE right=-1')))
     if edger.ndim == 0:
       edger = np.array([str(edger)])
-    # Remove duplicates from edge.txt list (shaves off a few milliseconds :) )
+
+    #remove duplicates from edge list:
     edge = list(set(list(edgel) + list(edger)))
 
-    # Loop through lines in this file to set "notocean=0" for ocean areas
-    for edgeval in edge: # edgeval = integer on line in "edge_sorted.txt"
-      # ocean where value = water (0) and at edge
-      grass.write_command('db.execute', stdin='UPDATE ' + ocean_binary + ' SET notocean=0 where cat=' + edgeval + ' AND value=0', input='-', quiet=True)
+    print("set ocean values")
+    #loop through lines in edge to set 'notocean=0' for ocean areas:
+    for edgeval in edge:
+        execute(stdin='UPDATE '+ocean_binary+' SET notocean=0 where cat=' + edgeval + ' AND value=0', input='-', quiet=True)
 
-    print "Creating a binary raster of continent (1) and ocean (0)"
-    grass.run_command('v.to.rast', input=ocean_binary, output=ocean_binary, use='attr', attrcolumn='notocean', layer='1', overwrite=True, quiet=True)
+    #convert to raster to get the final mask file:
+    to_rast(input=ocean_binary,output=ocean_binary_raster,use='attr',attribute_column='notocean',layer='1',overwrite=True)
+
+    export(input=ocean_binary_raster, output='Global_'+age+'_GEBCO2020_mask.tif', type='Float32', format='GTiff', flags='f')
+
+
     
-    print "Producing topography with ocean removed..."
-    # NULL values for ocean
-    # leave the binary raster intact
-    grass.run_command('g.copy', rast=ocean_binary + ',' + notocean_only, overwrite=True)
-    grass.run_command('r.null', map=notocean_only, setnull='0') # Turns ocean to null
-    # Just in case the ocean binary is somehow lacking ocean -- change this to 0!
-    # This is really just a patch for something that came up while doing this on a global scale
-    #for age in self.ages:
-    grass.run_command('r.null', map='ocean_binary_'+age, null='0') # Turns ocean to null
-
-    print "Converting notocean_only maps to vector..."
-
-    #for age in self.ages:
-    print age
-    notocean_only="notocean_only_" + age
-    grass.run_command('r.to.vect', input=notocean_only, output=notocean_only, type_='area', overwrite=True)
-
-    print "Done."
-
+    
 # 3. Create flow routing grid: topo plus ice without ocean
 def flow_routing_grid(self, subglacial=False):
   print "*************"
